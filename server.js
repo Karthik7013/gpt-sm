@@ -4,18 +4,67 @@ import fetch from "node-fetch";
 const app = express();
 app.use(express.json());
 
-// Updated list of VERIFIED free models (as of 2024)
-const FREE_MODELS = [
-  "meta-llama/llama-3.2-3b-instruct:free",
-  "meta-llama/llama-3.2-1b-instruct:free",
-  "google/gemma-2-9b-it:free",
-  "microsoft/phi-3-mini-128k-instruct:free",
-  "microsoft/phi-3-medium-128k-instruct:free",
-  "nousresearch/hermes-3-llama-3.1-405b:free",
-  "qwen/qwen-2-7b-instruct:free"
-];
+let cachedFreeModels = [];
+let lastFetch = 0;
+const CACHE_DURATION = 3600000; // 1 hour
 
-async function callOpenRouter(prompt, model, timeout = 15000) {
+// Fetch available free models from OpenRouter
+async function getFreeModels() {
+  try {
+    // Return cached models if still valid
+    if (cachedFreeModels.length > 0 && Date.now() - lastFetch < CACHE_DURATION) {
+      return cachedFreeModels;
+    }
+
+    console.log("Fetching available models from OpenRouter...");
+    const response = await fetch("https://openrouter.ai/api/v1/models", {
+      headers: {
+        "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch models: ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    
+    // Filter for free models (where both prompt and completion costs are "0")
+    const freeModels = data.data
+      .filter(m => {
+        const promptPrice = parseFloat(m.pricing?.prompt || "1");
+        const completionPrice = parseFloat(m.pricing?.completion || "1");
+        return promptPrice === 0 && completionPrice === 0;
+      })
+      .map(m => m.id)
+      .slice(0, 10); // Limit to first 10 free models
+
+    if (freeModels.length === 0) {
+      console.warn("No free models found, using fallback list");
+      return [
+        "meta-llama/llama-3.2-3b-instruct:free",
+        "google/gemma-2-9b-it:free"
+      ];
+    }
+
+    cachedFreeModels = freeModels;
+    lastFetch = Date.now();
+    
+    console.log(`Found ${freeModels.length} free models:`, freeModels);
+    return freeModels;
+
+  } catch (err) {
+    console.error("Error fetching models:", err.message);
+    // Fallback models if API call fails
+    return [
+      "meta-llama/llama-3.2-3b-instruct:free",
+      "google/gemma-2-9b-it:free",
+      "microsoft/phi-3-mini-128k-instruct:free"
+    ];
+  }
+}
+
+async function callOpenRouter(prompt, model, timeout = 20000) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
 
@@ -44,7 +93,21 @@ async function callOpenRouter(prompt, model, timeout = 15000) {
 }
 
 app.get("/", (req, res) => {
-  res.send("OpenRouter API with auto-fallback running.");
+  res.send("OpenRouter API with dynamic model discovery running.");
+});
+
+// Endpoint to check available free models
+app.get("/models", async (req, res) => {
+  try {
+    const models = await getFreeModels();
+    res.json({ 
+      free_models: models,
+      count: models.length,
+      cached: Date.now() - lastFetch < CACHE_DURATION
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post("/chat", async (req, res) => {
@@ -55,65 +118,55 @@ app.post("/chat", async (req, res) => {
       return res.status(400).json({ error: "Prompt is required" });
     }
 
+    // Get list of free models dynamically
+    const freeModels = await getFreeModels();
+    
+    if (freeModels.length === 0) {
+      return res.status(503).json({ 
+        error: "No free models available at this time" 
+      });
+    }
+
     let lastError = null;
     const attemptedModels = [];
     
     // Try each model in sequence
-    for (const model of FREE_MODELS) {
+    for (const model of freeModels) {
       try {
-        console.log(`Attempting model: ${model}`);
+        console.log(`Attempting: ${model}`);
         attemptedModels.push(model);
         
         const response = await callOpenRouter(prompt, model);
         const data = await response.json();
 
+        // Log full response for debugging
+        console.log(`Response status: ${response.status}`);
+        if (!response.ok) {
+          console.log(`Error response:`, JSON.stringify(data, null, 2));
+        }
+
         // Success case
         if (response.ok && data.choices?.[0]?.message?.content) {
-          console.log(`✓ Success with model: ${model}`);
+          console.log(`✓ Success with: ${model}`);
           return res.json({ 
             reply: data.choices[0].message.content,
-            model_used: model,
-            attempted_models: attemptedModels
+            model_used: model
           });
         }
 
         // Error handling
         if (data.error) {
-          const errorMsg = data.error.message || data.error;
-          console.log(`✗ Model ${model} failed: ${errorMsg}`);
+          const errorMsg = typeof data.error === 'string' ? data.error : data.error.message;
+          console.log(`✗ Failed: ${errorMsg}`);
           lastError = errorMsg;
           
-          // Skip model if it doesn't exist
-          if (
-            errorMsg.includes("No endpoints found") ||
-            errorMsg.includes("not found") ||
-            errorMsg.includes("invalid model")
-          ) {
-            console.log(`  → Skipping unavailable model`);
-            continue;
-          }
-          
-          // Retry on overload/rate limit
-          if (
-            data.error.code === 429 || 
-            errorMsg.includes("overloaded") ||
-            errorMsg.includes("rate limit") ||
-            errorMsg.includes("capacity")
-          ) {
-            console.log(`  → Model overloaded, trying next...`);
-            continue;
-          }
+          // Continue to next model on any error
+          continue;
         }
 
       } catch (err) {
-        console.log(`✗ Model ${model} error: ${err.message}`);
+        console.log(`✗ Exception: ${err.message}`);
         lastError = err.message;
-        
-        // Continue on timeout or network errors
-        if (err.name === 'AbortError' || err.message.includes('timeout')) {
-          console.log(`  → Timeout, trying next model...`);
-          continue;
-        }
         continue;
       }
     }
@@ -123,7 +176,8 @@ app.post("/chat", async (req, res) => {
     res.status(503).json({ 
       error: "All models are currently unavailable. Please try again later.",
       attempted_models: attemptedModels,
-      last_error: lastError 
+      last_error: lastError,
+      suggestion: "Try GET /models to see available models"
     });
 
   } catch (err) {
