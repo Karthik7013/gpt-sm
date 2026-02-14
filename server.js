@@ -4,36 +4,47 @@ import fetch from "node-fetch";
 const app = express();
 app.use(express.json());
 
-// List of free models to try in order
+// Updated list of VERIFIED free models (as of 2024)
 const FREE_MODELS = [
   "meta-llama/llama-3.2-3b-instruct:free",
+  "meta-llama/llama-3.2-1b-instruct:free",
   "google/gemma-2-9b-it:free",
   "microsoft/phi-3-mini-128k-instruct:free",
-  "meta-llama/llama-3.2-1b-instruct:free",
-  "qwen/qwen-2-7b-instruct:free",
-  "huggingfaceh4/zephyr-7b-beta:free"
+  "microsoft/phi-3-medium-128k-instruct:free",
+  "nousresearch/hermes-3-llama-3.1-405b:free",
+  "qwen/qwen-2-7b-instruct:free"
 ];
 
-async function callOpenRouter(prompt, model) {
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": process.env.YOUR_SITE_URL || "https://localhost:3000",
-      "X-Title": process.env.YOUR_APP_NAME || "ChatApp"
-    },
-    body: JSON.stringify({
-      model: model,
-      messages: [{ role: "user", content: prompt }]
-    })
-  });
+async function callOpenRouter(prompt, model, timeout = 15000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
 
-  return response;
+  try {
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": process.env.YOUR_SITE_URL || "https://localhost:3000",
+        "X-Title": process.env.YOUR_APP_NAME || "ChatApp"
+      },
+      body: JSON.stringify({
+        model: model,
+        messages: [{ role: "user", content: prompt }]
+      }),
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+    return response;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
+  }
 }
 
 app.get("/", (req, res) => {
-  res.send("OpenRouter API with auto-fallback running on Vercel.");
+  res.send("OpenRouter API with auto-fallback running.");
 });
 
 app.post("/chat", async (req, res) => {
@@ -45,52 +56,78 @@ app.post("/chat", async (req, res) => {
     }
 
     let lastError = null;
+    const attemptedModels = [];
     
     // Try each model in sequence
     for (const model of FREE_MODELS) {
       try {
-        console.log(`Trying model: ${model}`);
+        console.log(`Attempting model: ${model}`);
+        attemptedModels.push(model);
         
         const response = await callOpenRouter(prompt, model);
         const data = await response.json();
 
-        // Check if request was successful
-        if (response.ok && data.choices && data.choices[0]) {
+        // Success case
+        if (response.ok && data.choices?.[0]?.message?.content) {
+          console.log(`✓ Success with model: ${model}`);
           return res.json({ 
             reply: data.choices[0].message.content,
-            model_used: model
+            model_used: model,
+            attempted_models: attemptedModels
           });
         }
 
-        // Check for specific errors
+        // Error handling
         if (data.error) {
-          console.log(`Model ${model} failed:`, data.error.message);
-          lastError = data.error.message;
+          const errorMsg = data.error.message || data.error;
+          console.log(`✗ Model ${model} failed: ${errorMsg}`);
+          lastError = errorMsg;
           
-          // If it's a rate limit or overload, try next model
+          // Skip model if it doesn't exist
+          if (
+            errorMsg.includes("No endpoints found") ||
+            errorMsg.includes("not found") ||
+            errorMsg.includes("invalid model")
+          ) {
+            console.log(`  → Skipping unavailable model`);
+            continue;
+          }
+          
+          // Retry on overload/rate limit
           if (
             data.error.code === 429 || 
-            data.error.message?.includes("overloaded") ||
-            data.error.message?.includes("rate limit")
+            errorMsg.includes("overloaded") ||
+            errorMsg.includes("rate limit") ||
+            errorMsg.includes("capacity")
           ) {
-            continue; // Try next model
+            console.log(`  → Model overloaded, trying next...`);
+            continue;
           }
         }
+
       } catch (err) {
-        console.log(`Model ${model} error:`, err.message);
+        console.log(`✗ Model ${model} error: ${err.message}`);
         lastError = err.message;
-        continue; // Try next model
+        
+        // Continue on timeout or network errors
+        if (err.name === 'AbortError' || err.message.includes('timeout')) {
+          console.log(`  → Timeout, trying next model...`);
+          continue;
+        }
+        continue;
       }
     }
 
     // If all models failed
+    console.error("All models exhausted");
     res.status(503).json({ 
-      error: "All models are currently unavailable",
+      error: "All models are currently unavailable. Please try again later.",
+      attempted_models: attemptedModels,
       last_error: lastError 
     });
 
   } catch (err) {
-    console.error("Error:", err);
+    console.error("Unexpected error:", err);
     res.status(500).json({ error: err.message });
   }
 });
